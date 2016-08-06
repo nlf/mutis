@@ -1,0 +1,25 @@
+{
+  "name": "mutis",
+  "version": "1.0.0",
+  "description": "mutexes powered by redis",
+  "main": "lib/index.js",
+  "scripts": {
+    "test": "lab -a code -t 100 -L"
+  },
+  "keywords": [
+    "redis",
+    "mutex",
+    "lock"
+  ],
+  "author": "Nathan LaFreniere <quitlahok@gmail.com>",
+  "license": "MIT",
+  "devDependencies": {
+    "code": "^3.0.2",
+    "eslint-config-andyet": "^2.0.0",
+    "lab": "^10.9.0",
+    "redis-mock": "^0.10.0"
+  },
+  "dependencies": {
+    "bluebird": "^3.4.1"
+  }
+}
