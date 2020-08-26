@@ -1,117 +1,132 @@
-'use strict';
+'use strict'
 
-const Promise = require('bluebird');
-const Redis = require('redis-mock');
-const redis = Redis.createClient();
-redis.duplicate = function () {
+const Redis = require('ioredis')
 
-  return this;
-};
+const Mutis = require('../')
+const Lock = require('../lib/lock')
+const Errors = require('../lib/errors')
 
-const Mutis = require('../');
-const mutis = new Mutis(redis);
+const settings = { connection: process.env.REDIS_URL || 'redis://127.0.0.1:6379', retryDelay: 50 }
+const redis = new Redis(settings.connection)
+const mutis = new Mutis(settings)
+const mutisB = new Mutis(settings)
 
-const lab = exports.lab = require('lab').script();
-const describe = lab.suite;
-const it = lab.test;
-const beforeEach = lab.beforeEach;
-const Code = require('code');
-const expect = Code.expect;
-const fail = Code.fail;
+const { after, afterEach, describe, it } = exports.lab = require('@hapi/lab').script()
+const { expect } = require('@hapi/code')
 
-describe('mutis', () => {
+describe('mutis.lock()', () => {
+  after(() => {
+    return Promise.all([
+      redis.quit(),
+      mutis.quit(),
+      mutisB.quit()
+    ])
+  })
 
-  beforeEach(() => {
+  afterEach(() => {
+    return redis.del('test._lock')
+  })
 
-    return mutis._client.delAsync('test._lock');
-  });
+  it('can lock a key', async () => {
+    const lock = await mutis.lock('test')
+    expect(lock).to.be.an.instanceof(Lock)
+    const expiry = await redis.get('test._lock')
+    expect(Number(expiry)).to.equal(lock.expires)
+  })
 
-  it('can lock a key', () => {
+  it('can unlock a key', async () => {
+    const lock = await mutis.lock('test')
+    expect(lock).to.be.an.instanceof(Lock)
+    await lock.unlock()
+    const expiry = await redis.get('test._lock')
+    expect(expiry).to.equal(null)
+  })
 
-    return mutis.lock('test').then(() => {
+  it('waits for a lock', async () => {
+    const lock = await mutis.lock('test')
+    const start = Date.now()
+    setTimeout(() => lock.unlock(), 75)
+    await mutis.lock('test')
+    const delay = Date.now() - start
+    expect(delay).to.be.above(75)
+  })
 
-      return mutis._client.getAsync('test._lock');
-    }).then((val) => {
+  it('will take over a lock that has expired', async () => {
+    await mutis.lock('test', { ttl: 50 })
+    const start = Date.now()
+    const second = await mutisB.lock('test')
+    const elapsed = Date.now() - start
+    expect(elapsed).to.be.above(50)
+    const value = await redis.get('test._lock')
+    expect(second.expires).to.equal(Number(value))
+  })
 
-      expect(val).to.equal('locked');
-    });
-  });
+  it('respects timeout value when waiting for a lock', async () => {
+    await mutis.lock('test')
+    const start = Date.now()
+    const err = await expect(mutis.lock('test', { timeout: 10 })).to.reject(Errors.LockTimeoutError)
+    const elapsed = Date.now() - start
+    expect(err.key).to.equal('test')
+    expect(err.timeout).to.equal(10)
+    expect(elapsed).to.be.above(10)
+  })
 
-  it('can unlock a key implicitly', () => {
+  it('rejects when attempting to free twice', async () => {
+    const lock = await mutis.lock('test')
+    await lock.unlock()
+    const err = await expect(lock.unlock()).to.reject(Errors.AlreadyUnlockedError)
+    expect(err.key).to.equal('test')
+  })
 
-    return mutis.lock('test').then((unlock) => {
+  it('rejects when attempting to free an expired lock', async () => {
+    const lock = await mutis.lock('test', { ttl: 50 })
+    await new Promise((resolve) => setTimeout(resolve, 75))
+    const err = await expect(lock.unlock()).to.reject(Errors.ExpiredLockError)
+    expect(err.key).to.equal('test')
+  })
 
-      return mutis._client.getAsync('test._lock').then((val) => {
+  it('will retry acquiring a lock if it is freed after SETNX fails', async (flags) => {
+    flags.onCleanup = () => {
+      if (mutis.client._get) {
+        mutis.client.get = mutis.client._get
+        delete mutis.client._get
+      }
+    }
 
-        expect(val).to.equal('locked');
-        return unlock();
-      }).then(() => {
+    await mutis.lock('test')
+    mutis.client._get = mutis.client.get
+    mutis.client.get = async (...args) => {
+      mutis.client.get = mutis.client._get
+      delete mutis.client._get
+      await redis.del('test._lock')
+      return null
+    }
 
-        return mutis._client.getAsync('test._lock');
-      }).then((val) => {
+    const lock = await mutis.lock('test')
+    const value = await redis.get('test._lock')
+    expect(lock.expires).to.equal(Number(value))
+  })
 
-        expect(val).to.equal(null);
-      });
-    });
-  });
+  it('will retry acquiring a lock if it is overwritten between GET and GETSET', async (flags) => {
+    flags.onCleanup = () => {
+      if (mutis.client._getset) {
+        mutis.client.getset = mutis.client._getset
+        delete mutis.client._getset
+      }
+    }
 
-  it('can unlock a key explicitly', () => {
-
-    return mutis.lock('test').then(() => {
-
-      return mutis._client.getAsync('test._lock').then((val) => {
-
-        expect(val).to.equal('locked');
-        return mutis.unlock('test');
-      }).then(() => {
-
-        return mutis._client.getAsync('test._lock');
-      }).then((val) => {
-
-        expect(val).to.equal(null);
-      });
-    });
-  });
-
-  it('waits for a lock', () => {
-
-    return mutis.lock('test').then((unlock) => {
-
-      const start = Date.now();
-      setTimeout(() => {
-
-        unlock();
-      }, 66);
-
-      return mutis.lock('test').then(() => {
-
-        const delay = Date.now() - start;
-        expect(delay).to.be.about(66, 3);
-      });
-    });
-  });
-
-  it('respects timeout value when waiting for a lock', () => {
-
-    return mutis.lock('test').then((unlock) => {
-
-      setTimeout(() => {
-
-        unlock();
-      }, 66);
-
-      return mutis.lock('test', 10).then(() => {
-
-        fail('this should never be reached');
-      }).catch((err) => {
-
-        expect(err).to.exist();
-        expect(err).to.be.an.instanceof(Promise.TimeoutError);
-        return mutis._client.getAsync('test._lock').then((val) => {
-
-          expect(val).to.equal('locked');
-        });
-      });
-    });
-  });
-});
+    // using redis.set here instead of creating a lock so we can put a timestamp in the past
+    await redis.set('test._lock', Date.now() - 1000)
+    mutis.client._getset = mutis.client.getset
+    mutis.client.getset = async (key, value) => {
+      mutis.client.getset = mutis.client._getset
+      delete mutis.client._getset
+      // we delete the key here and return the old value so that on the next iteration the lock can be acquired
+      await redis.del(key)
+      return value - 1000
+    }
+    const lock = await mutis.lock('test')
+    const value = await mutis.client.get('test._lock')
+    expect(lock.expires).to.equal(Number(value))
+  })
+})
